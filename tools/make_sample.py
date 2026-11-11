@@ -8,12 +8,20 @@ The sample deliberately contains:
 * data-0002.parquet: written without column statistics.  Ticket 8888 is in
   its second row group and the checker must read both row groups because the
   statistics are missing.
-* delete-pos-0001.parquet: positional delete for 4242 at row 99.
-* delete-pos-0002.parquet: positional delete for 8888 at row 19.
+* delete-pos-0001.parquet: positional deletes that hit *both* data files.
+  It removes ticket 1003 (row 3) and ticket 4242 (row 99) from data-0001,
+  and ticket 7003 (row 3) from data-0002.  The last record points at
+  data-0002 row 99, which is out of range and must never match.
+* delete-pos-0002.parquet: a second positional delete for 8888 at row 19 of
+  data-0002, so the same data file is covered by two delete files.
 * delete-pos-stale-0001.parquet: a tempting delete for 4242/row 99, but with
-  sequence number 6 < data file sequence number 7; it must be ignored.
+  sequence number 6 < data file sequence number 7; it must be ignored for
+  row removal but still purged during compaction.
 * An equality-delete manifest entry with no uploaded replica; it must be
-  ignored because only positional deletes are processed.
+  ignored by the checker and make the compaction endpoint refuse to run.
+
+The data schema carries explicit Parquet field ids so the compaction
+rewrites can be verified to preserve them.
 """
 
 from __future__ import annotations
@@ -34,20 +42,29 @@ DELETE2_PATH = f"{BASE}/delete-pos/delete-pos-0002.parquet"
 STALE_DELETE_PATH = f"{BASE}/delete-pos/delete-pos-stale-0001.parquet"
 EQ_DELETE_PATH = f"{BASE}/delete-eq/delete-eq-0001.parquet"
 
+
+def _field(name: str, data_type: pa.DataType, field_id: int) -> pa.Field:
+    return pa.field(
+        name,
+        data_type,
+        metadata={b"PARQUET:field_id": str(field_id).encode("ascii")},
+    )
+
+
 DATA_SCHEMA = pa.schema(
     [
-        ("ticket_no", pa.int64()),
-        ("passenger_name", pa.string()),
-        ("fare_cents", pa.int64()),
-        ("booking_status", pa.string()),
-        ("voyage_date", pa.string()),
+        _field("ticket_no", pa.int64(), 1),
+        _field("passenger_name", pa.string(), 2),
+        _field("fare_cents", pa.int64(), 3),
+        _field("booking_status", pa.string(), 4),
+        _field("voyage_date", pa.string(), 5),
     ]
 )
 
 DELETE_SCHEMA = pa.schema(
     [
-        ("file_path", pa.string()),
-        ("pos", pa.int64()),
+        _field("file_path", pa.string(), 101),
+        _field("pos", pa.int64(), 102),
     ]
 )
 
@@ -116,6 +133,12 @@ def write_manifest() -> None:
         f"{EQ_DELETE_PATH},delete-eq-0001.parquet,equality_delete,12",
     ]
     (SAMPLE / "manifest.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Compaction refuses manifests with equality deletes, so the offline
+    # compaction sample ships the same partition minus that entry.
+    compact_lines = [line for line in lines if "equality_delete" not in line]
+    (SAMPLE / "manifest-compact.csv").write_text(
+        "\n".join(compact_lines) + "\n", encoding="utf-8"
+    )
 
 
 def main() -> None:
@@ -127,7 +150,8 @@ def main() -> None:
         [
             (DATA1_PATH, 3),   # ticket 1003
             (DATA1_PATH, 99),  # ticket 4242, last row of row group 4
-            (DATA2_PATH, 99),  # wrong path / out-of-range; must not match
+            (DATA2_PATH, 3),   # ticket 7003: same delete file hits data-0002
+            (DATA2_PATH, 99),  # out of range (data-0002 has 20 rows); ignored
         ],
     )
     write_delete(
@@ -149,6 +173,7 @@ def main() -> None:
         "delete-pos-0002.parquet",
         "delete-pos-stale-0001.parquet",
         "manifest.csv",
+        "manifest-compact.csv",
     ):
         print(f"wrote {SAMPLE / name}")
 

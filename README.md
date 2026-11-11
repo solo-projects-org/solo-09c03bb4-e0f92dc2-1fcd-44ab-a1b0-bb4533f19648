@@ -1,8 +1,10 @@
-# 渡轮结算 · Iceberg v2 票号删除核对
+# 渡轮结算 · Iceberg v2 票号删除核对与离线压实
 
 用于核对湖仓源快照中，某航次日分区里的票号是否已被 **Iceberg v2 位置删除**
-（positional delete）标记。网页接收有效文件清单和对应 Parquet 副本，输入整数
-票号，逐条给出原文件、从 0 起算的文件内行号、是否已删除以及命中的删除文件。
+（positional delete）标记，并支持把一个数据文件离线**压实**（compaction）：
+清掉已撤销的票，同时清理位置删除文件，避免其他文件里已删的票重新入账。
+网页接收有效文件清单和对应 Parquet 副本。核对功能输入整数票号，逐条给出原文件、
+从 0 起算的文件内行号、是否已删除以及命中的删除文件；压实功能返回可下载的 ZIP 包。
 
 ## 快速启动
 
@@ -108,12 +110,97 @@ JSON 也支持，顶层可以是数组，或包含 `files` / `entries` 数组的
 - `data-0002.parquet`：写入时关闭了列统计，票号 **8888** 在第 2 个行组
   （全局行号 **19**）。因为没有统计，两个行组都会被读取，随后命中
   `delete-pos-0002.parquet`。
+- `delete-pos-0001.parquet`：**同一份位置删除文件在两个数据文件上都生效**——
+  指向 `data-0001.parquet` 的行 3（票号 1003）、行 99（票号 4242），以及
+  `data-0002.parquet` 的行 3（票号 7003）；另有一条指向 `data-0002.parquet`
+  行 99 的越界记录（该文件只有 20 行），永不命中。
 - `delete-pos-stale-0001.parquet`：也指向 4242 / 行 99，但数据序列号是 6，
-  小于数据文件的 7，因此被忽略。
-- 清单中的 `equality_delete` 项没有上传副本，核对仍正常完成，因为它被忽略。
+  小于数据文件的 7，因此核对时被忽略；压实时不删行，但记录仍会被清掉。
+- 清单中的 `equality_delete` 项没有上传副本，核对仍正常完成，因为它被忽略；
+  压实则会直接拒绝含等值删除的清单。
+- 数据与删除文件的 Parquet schema 都带显式字段 ID，压实重写后保持不变。
 
 样例默认票号：`4242, 1003, 4218, 8888, 9999`。其中 1003 已删除，4218
 存在但未删除，9999 不存在。
+
+## 离线压实
+
+网页下方的 **“离线压实”** 卡片接收：
+
+1. 同一航次日分区的 Iceberg v2 有效文件清单（CSV 或 JSON，格式同上）。
+2. **目标数据文件**与清单中**全部位置删除文件**的 Parquet 副本（可多选）。
+3. 目标数据文件在清单中的 `uploaded_filename`。
+
+### 压实规则
+
+- **拒绝等值删除**：清单含任何 `equality_delete` 条目时直接中止，不生成压实包，
+  并指出对应文件名。
+- **匹配方式**：按目标文件的 `original_path` 与从 0 起算的原始行号匹配；
+  位置删除文件的数据序列号 **不小于** 目标文件数据序列号的记录才删行
+  （相等也生效）。序列号更小的记录不删行。
+- **删除文件清理**：位置删除文件中所有指向目标旧路径的记录全部移除
+  （包括序列号过期、行号越界的记录），指向其他路径的记录原样保留顺序。
+- **重写保真**：重写后的 Parquet 保留列结构（含已有字段 ID、可空性、嵌套类型
+  和表级元数据）以及剩余行的相对顺序。
+- **序列号不变**：替换文件沿用原数据序列号，并在包内清单中逐文件标明。
+- **退役与不打包**：数据行被全部清空的文件只列为 `retired`，不写入 ZIP；
+  没有任何变化的删除文件不打包也不列条目。
+- **全有或全无**：缺件、文件打不开或写入复读失败时，指出具体文件名并中止，
+  绝不返回压实包。
+
+### 压实包结构
+
+ZIP 内只放发生替换的新 Parquet（扁平文件名，统一 `replaced-` 前缀，避免路径
+穿越）和 `compaction-manifest.json`：
+
+```text
+compaction-data-0001.zip
+├── replaced-data-0001.parquet
+├── replaced-delete-pos-0001.parquet
+└── compaction-manifest.json
+```
+
+清单按旧路径（`old_path`）标明每个替换/退役文件的状态、替换文件名与数据序列号：
+
+```json
+{
+  "schema_version": 1,
+  "target": {
+    "old_path": "s3://.../data/data-0001.parquet",
+    "uploaded_filename": "data-0001.parquet",
+    "data_sequence_number": 7
+  },
+  "summary": { "replaced": 2, "retired": 1, "unchanged": 1 },
+  "files": [
+    {
+      "old_path": "s3://.../data/data-0001.parquet",
+      "uploaded_filename": "data-0001.parquet",
+      "file_type": "data",
+      "data_sequence_number": 7,
+      "status": "replaced",
+      "replacement_file": "replaced-data-0001.parquet",
+      "original_rows": 100,
+      "remaining_rows": 98,
+      "removed_rows": 2
+    }
+  ],
+  "warnings": []
+}
+```
+
+### 样例压实
+
+压实卡片上的两个按钮直接下载内置样例压实包：
+
+- 目标 `data-0001.parquet`：删除票号 1003、4242 两行；`delete-pos-0001.parquet`
+  中指向 `data-0002.parquet` 的两条记录原样保留；`delete-pos-stale-0001.parquet`
+  清空后退役。
+- 目标 `data-0002.parquet`：删除票号 7003、8888 两行；同一份
+  `delete-pos-0001.parquet` 中指向 `data-0001.parquet` 的记录原样保留；
+  `delete-pos-0002.parquet` 清空后退役。
+
+样例压实使用不含等值删除条目的 `sample/manifest-compact.csv`；核对页继续使用
+含等值删除条目的 `sample/manifest.csv`。
 
 ## 本地开发与测试
 
@@ -122,7 +209,7 @@ JSON 也支持，顶层可以是数组，或包含 `files` / `entries` 数组的
 ```bash
 python3 -m pip install -r requirements.txt
 python3 app.py                     # http://localhost:8000
-python3 -m pytest -q               # 36 个测试
+python3 -m pytest -q               # 65 个测试
 ```
 
 重新生成样例（会覆盖 `sample/` 下的 Parquet 和清单）：
@@ -134,11 +221,12 @@ python3 tools/make_sample.py
 ## 目录
 
 ```
-app.py                     Flask 路由、上传处理、票号解析
+app.py                     Flask 路由、上传处理、票号解析、压实包下载
 checker/manifest.py        清单解析与校验
 checker/engine.py          PyArrow 行组跳读、行号计算、位置删除匹配
+checker/compactor.py       离线压实：删行、删除文件清理、ZIP 与包内清单
 checker/errors.py          CheckError（始终带文件名）
-templates/index.html       网页
+templates/index.html       网页（核对 + 离线压实入口）
 static/style.css           样式
 sample/                    内置样例（清单 + Parquet）
 tools/make_sample.py       样例生成脚本
@@ -149,7 +237,11 @@ docker-compose.yml         启动配置
 
 ## 已知边界
 
-- 位置删除文件会整体读入内存建立 `(file_path, pos)` 索引；适用于常见规模。
+- 位置删除文件会整体读入内存建立 `(file_path, pos)` 索引；压实也会整体读入
+  目标数据文件与位置删除文件，适用于常见规模。
 - 每个票号独立扫描数据文件。一次输入大量票号时耗时随票号数线性增长。
+- 压实每次只处理一个目标数据文件；多个数据文件需分别发起请求。
+- 重写后的 Parquet 使用 snappy 压缩并按 PyArrow 默认行组大小落盘；列结构、
+  字段 ID 与剩余行顺序保持不变，但不保证行组边界与原文件一致。
 - 路径按字符串精确比较，不解析 `s3://`、`file://` 等 URI 等价关系。
   请保证清单的 `original_path` 与删除记录中的 `file_path` 写法完全一致。

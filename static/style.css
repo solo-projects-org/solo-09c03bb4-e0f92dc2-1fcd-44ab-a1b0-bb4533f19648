@@ -308,6 +308,17 @@ tbody tr.rg-read { background: #ffffff; }
 .card-head { margin-bottom: 14px; }
 .card-head p { margin: 4px 0 0; font-size: 13px; }
 
+.compact-card { border-top: 4px solid var(--teal); }
+.compact-rules { line-height: 1.7; }
+.compact-notice { margin: 14px 0 0; }
+.button.primary.compact { background: var(--teal); box-shadow: 0 2px 8px rgba(15, 118, 110, .22); }
+.button.primary.compact:hover { background: #0b5f58; }
+.form-actions .button.compact-ghost {
+  border-color: #b9ddd6;
+  color: var(--teal);
+}
+.form-actions .button.compact-ghost:hover { background: #f0f8f6; }
+
 .kind {
   display: inline-block;
   padding: 2px 7px;

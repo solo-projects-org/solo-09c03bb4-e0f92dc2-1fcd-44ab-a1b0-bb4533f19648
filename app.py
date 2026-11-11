@@ -1,14 +1,16 @@
-"""Flask front end for the Iceberg positional-delete checker."""
+"""Flask front end for the Iceberg positional-delete checker and compactor."""
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import tempfile
 from pathlib import Path
 
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, send_file
 
+from checker.compactor import run_compaction
 from checker.engine import CheckResult, run_check
 from checker.errors import CheckError
 from checker.manifest import parse_manifest
@@ -76,6 +78,16 @@ def _sample_uploaded_paths(manifest) -> dict[str, Path]:
     return paths
 
 
+def _sample_compaction_paths(manifest) -> dict[str, Path]:
+    """Target data file plus every positional delete replica."""
+    paths: dict[str, Path] = {}
+    for entry in [*manifest.data_files, *manifest.position_delete_files]:
+        candidate = SAMPLE_DIR / entry.uploaded_filename
+        if candidate.is_file():
+            paths[entry.uploaded_filename] = candidate
+    return paths
+
+
 def _render(
     *,
     result: CheckResult | None = None,
@@ -83,6 +95,8 @@ def _render(
     tickets_text: str = "",
     ticket_column: str = "ticket_no",
     source: str = "",
+    compact_error: bool = False,
+    target_file: str = "",
     status: int = 200,
 ):
     return (
@@ -93,6 +107,8 @@ def _render(
             tickets_text=tickets_text,
             ticket_column=ticket_column,
             source=source,
+            compact_error=compact_error,
+            target_file=target_file,
             sample_tickets=SAMPLE_TICKETS,
             max_upload_mb=app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024),
         ),
@@ -174,6 +190,73 @@ def check():
         tickets_text=tickets_text,
         ticket_column=ticket_column,
         source="upload",
+    )
+
+
+@app.get("/sample/compact")
+def sample_compact():
+    target_file = (request.args.get("target") or "data-0001.parquet").strip()
+    try:
+        manifest = parse_manifest(
+            (SAMPLE_DIR / "manifest-compact.csv").read_bytes()
+        )
+        result = run_compaction(
+            manifest,
+            _sample_compaction_paths(manifest),
+            target_file,
+        )
+    except CheckError as exc:
+        return _render(
+            error=exc,
+            source="sample-compact",
+            compact_error=True,
+            target_file=target_file,
+            status=400,
+        )
+    return send_file(
+        io.BytesIO(result.zip_buffer),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=result.zip_name,
+    )
+
+
+@app.post("/compact")
+def compact():
+    target_file = request.form.get("target_file", "").strip()
+    manifest_file = request.files.get("manifest")
+    parquet_files = request.files.getlist("files")
+
+    if manifest_file is None or not manifest_file.filename:
+        return _render(
+            error=CheckError("请上传 Iceberg v2 有效文件清单（CSV 或 JSON）。"),
+            source="upload-compact",
+            compact_error=True,
+            target_file=target_file,
+            status=400,
+        )
+
+    try:
+        manifest = parse_manifest(manifest_file.read())
+        with tempfile.TemporaryDirectory(prefix="iceberg-compact-") as temp:
+            uploaded_paths = _save_uploads(parquet_files, Path(temp))
+            result = run_compaction(manifest, uploaded_paths, target_file)
+            payload = result.zip_buffer
+            download_name = result.zip_name
+    except CheckError as exc:
+        return _render(
+            error=exc,
+            source="upload-compact",
+            compact_error=True,
+            target_file=target_file,
+            status=400,
+        )
+
+    return send_file(
+        io.BytesIO(payload),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=download_name,
     )
 
 

@@ -23,7 +23,7 @@
 <main class="wrap">
   {% if error %}
   <section class="alert" role="alert">
-    <h2>核对未完成</h2>
+    <h2>{% if compact_error %}压实未完成{% else %}核对未完成{% endif %}</h2>
     <p>{{ error.message }}</p>
     {% if error.files %}
     <p class="alert-files">涉及文件：</p>
@@ -31,7 +31,7 @@
       {% for file in error.files %}<li class="mono">{{ file }}</li>{% endfor %}
     </ul>
     {% endif %}
-    <p class="hint">为避免部分结论，本次没有返回任何票号的核对结果。</p>
+    <p class="hint">为避免部分结论，{% if compact_error %}本次没有生成任何压实包{% else %}本次没有返回任何票号的核对结果{% endif %}。</p>
   </section>
   {% endif %}
 
@@ -318,6 +318,68 @@
       </div>
     </form>
   </section>
+
+  <section class="card form-card compact-card">
+    <div class="card-head">
+      <h2>离线压实</h2>
+      <p class="subtle">
+        压实同一航次日分区里的一个目标数据文件：清掉已撤销的票，同时把位置删除文件中
+        指向该文件旧路径的记录移除，避免其他文件里已删的票重新入账。
+      </p>
+    </div>
+    <form method="post" action="{{ url_for('compact') }}" enctype="multipart/form-data">
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">有效文件清单 <small>CSV 或 JSON · 含等值删除将被拒绝</small></span>
+          <input type="file" name="manifest" accept=".csv,.json,text/csv,application/json" required>
+          <span class="field-hint">
+            与核对页相同的清单；出现 <code>equality_delete</code> 条目时不生成压实包
+          </span>
+        </label>
+        <label class="field">
+          <span class="field-label">Parquet 副本 <small>目标数据文件 + 全部位置删除文件</small></span>
+          <input type="file" name="files" accept=".parquet,application/octet-stream" multiple required>
+          <span class="field-hint">
+            文件名必须与清单的 <code>uploaded_filename</code> 一致；缺件即整单中止
+          </span>
+        </label>
+      </div>
+
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">目标数据文件名 <small>清单中的 uploaded_filename</small></span>
+          <input type="text" name="target_file" value="{{ target_file or 'data-0001.parquet' }}" placeholder="data-0001.parquet">
+          <span class="field-hint">
+            按原路径与从 0 起算的原始行号匹配；删除文件数据序列号不小于目标文件的记录才删行
+          </span>
+        </label>
+        <label class="field narrow">
+          <span class="field-label">压实包内容</span>
+          <span class="field-hint compact-rules">
+            ZIP 内放重写后的新 Parquet 和 <code>compaction-manifest.json</code>；
+            替换文件沿用原数据序列号，清空的文件只列为退役（retired），未改动的文件不打包。
+          </span>
+        </label>
+      </div>
+
+      <div class="form-actions">
+        <button class="button primary compact" type="submit">生成压实包（ZIP）</button>
+        <a class="button ghost compact-ghost"
+           href="{{ url_for('sample_compact', target='data-0001.parquet') }}">
+          下载样例压实包 · 目标 data-0001.parquet
+        </a>
+        <a class="button ghost compact-ghost"
+           href="{{ url_for('sample_compact', target='data-0002.parquet') }}">
+          下载样例压实包 · 目标 data-0002.parquet
+        </a>
+      </div>
+      <p class="notice compact-notice">
+        样例中 <code>delete-pos-0001.parquet</code> 同时在两个数据文件上生效：
+        压实 <code>data-0001.parquet</code> 时会删掉票号 <code>1003</code>、<code>4242</code> 两行，
+        而该删除文件里指向 <code>data-0002.parquet</code> 的记录原样保留。
+      </p>
+    </form>
+  </section>
 </main>
 
 <footer class="footer">
@@ -325,7 +387,8 @@
     <p>
       位置删除匹配条件：删除记录的 <code>file_path</code> 等于原始路径、
       <code>pos</code> 等于从 0 起算的文件内行号，且删除文件的数据序列号不小于数据文件。
-      缺失副本或任一读取失败都会中止整次核对。
+      离线压实重写时保留列结构（含已有字段 ID）和剩余行顺序；缺失副本或任一读写失败都会中止，
+      不返回部分结论或压实包。
     </p>
   </div>
 </footer>
